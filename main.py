@@ -1,8 +1,7 @@
-import argparse
 import csv
+import functions_framework
 import hashlib
 import os
-import sys
 
 from google.ads.googleads.client import GoogleAdsClient
 from google.ads.googleads.errors import GoogleAdsException
@@ -13,11 +12,75 @@ os.environ["GOOGLE_ADS_CONFIGURATION_FILE_PATH"] = "google-ads.yaml"
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "silken-tenure-383314-4699d25cba08.json"
 
 
+@functions_framework.http
+def add_customer_match_user_list(request):
+    """HTTP Cloud Function.
+    Args:
+        request (flask.Request): The request object.
+        <https://flask.palletsprojects.com/en/1.1.x/api/#incoming-request-data>
+    Returns:
+        The response text, or any set of values that can be turned into a
+        Response object using `make_response`
+        <https://flask.palletsprojects.com/en/1.1.x/api/#flask.make_response>.
+    """
+    if request.method == "POST":
+        request_data = request.get_json(force=True)
+
+        if request_data:
+            if any([
+                ("bucket_name" not in request_data),
+                ("blob_name" not in request_data),
+                ("customer_id" not in request_data)
+            ]):
+                return "Not enough data", 400
+
+            if ("user_list_id" in request_data):
+                user_list_id = request_data["user_list_id"]
+            else:
+                user_list_id = ""
+
+            bucket_name = request_data["bucket_name"]
+            blob_name = request_data["blob_name"]
+            customer_id = request_data["customer_id"]
+
+            ga_client = GoogleAdsClient.load_from_storage()
+
+            raw_records = get_file_from_gcs(
+                blob_name=blob_name,
+                file_path="/tmp/file.csv",
+                bucket_name=bucket_name
+            )
+
+            try:
+                main(
+                    ga_client=ga_client,
+                    customer_id=customer_id,
+                    run_job=True,
+                    user_list_id=user_list_id,
+                    records=raw_records
+                )
+            except GoogleAdsException as ex:
+                print(
+                    f"Request with ID '{ex.request_id}' failed with status "
+                    f"'{ex.error.code().name}' and includes the following errors:"
+                )
+                for error in ex.failure.errors:
+                    print(f"\tError with message '{error.message}'.")
+                    if error.location:
+                        for field_path_element in error.location.field_path_elements:
+                            print(f"\t\tOn field: {field_path_element.field_name}")
+                return f"{ex.error.code().name}", 500
+
+        else:
+            return "Bad request", 400
+
+
 def main(
     ga_client,
     customer_id,
     run_job,
-    user_list_id
+    user_list_id,
+    records
 ):
     googleads_service = ga_client.get_service("GoogleAdsService")
 
@@ -40,7 +103,8 @@ def main(
         customer_id=customer_id,
         user_list_resource_name=user_list_resource_name,
         run_job=run_job,
-        replace=replace
+        replace=replace,
+        records=records
     )
 
 
@@ -92,6 +156,7 @@ def add_users_to_customer_match_user_list(
     user_list_resource_name,
     run_job,
     replace,
+    records,
     offline_user_data_job_id=None,
 ):
     """Uses Customer Match to create and add users to a new user list.
@@ -151,7 +216,7 @@ def add_users_to_customer_match_user_list(
         operation.remove_all = True
         operations.append(operation)
 
-    operations.extend(build_offline_user_data_job_operations(ga_client))
+    operations.extend(build_offline_user_data_job_operations(ga_client, records))
 
     request = ga_client.get_type("AddOfflineUserDataJobOperationsRequest")
     request.resource_name = offline_user_data_job_resource_name
@@ -299,7 +364,7 @@ def print_customer_match_user_list_info(
     )
 
 
-def build_offline_user_data_job_operations(ga_client):
+def build_offline_user_data_job_operations(ga_client, raw_records):
     """Creates a raw input list of unhashed user information.
 
     Each element of the list represents a single user and is a dict containing a
@@ -312,11 +377,6 @@ def build_offline_user_data_job_operations(ga_client):
     Returns:
         A list containing the operations.
     """
-    raw_records = get_file_from_gcs(
-        blob_name="new_user_list.csv",
-        file_path="/tmp/file.csv",
-        bucket_name="customer_list_bucket"
-    )
 
     operations = []
     # Iterates over the raw input list and creates a UserData object for each
@@ -444,60 +504,3 @@ def get_file_from_gcs(blob_name, file_path, bucket_name):
 
     except Exception as e:
         print("Failed to get file: ", e)
-
-
-if __name__ == "__main__":
-    ga_client = GoogleAdsClient.load_from_storage()
-
-    parser = argparse.ArgumentParser(
-        description="Adds a customer match user list for specified customer."
-    )
-    # The following argument(s) should be provided to run the example.
-    parser.add_argument(
-        "-c",
-        "--customer_id",
-        type=str,
-        required=True,
-        help="The ID for the customer that owns the user list.",
-    )
-    parser.add_argument(
-        "-r",
-        "--run_job",
-        type=bool,
-        required=True,
-        help=(
-            "If true, runs the OfflineUserDataJob after adding operations. "
-            "The default value is False."
-        ),
-    )
-    parser.add_argument(
-        "-u",
-        "--user_list_id",
-        type=str,
-        required=False,
-        help=(
-            "The ID of an existing user list. If not specified, this example "
-            "will create a new user list."
-        ),
-    )
-
-    args = parser.parse_args()
-
-    try:
-        main(
-            ga_client=ga_client,
-            customer_id=args.customer_id,
-            run_job=args.run_job,
-            user_list_id=args.user_list_id
-        )
-    except GoogleAdsException as ex:
-        print(
-            f"Request with ID '{ex.request_id}' failed with status "
-            f"'{ex.error.code().name}' and includes the following errors:"
-        )
-        for error in ex.failure.errors:
-            print(f"\tError with message '{error.message}'.")
-            if error.location:
-                for field_path_element in error.location.field_path_elements:
-                    print(f"\t\tOn field: {field_path_element.field_name}")
-        sys.exit(1)
