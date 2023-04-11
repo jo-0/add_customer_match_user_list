@@ -35,7 +35,7 @@ def add_customer_match_user_list(request):
                 ("blob_name" not in request_data),
                 ("customer_id" not in request_data)
             ]):
-                return "Not enough data", 400
+                return make_response("Not enough data", 400)
 
             if ("user_list_id" in request_data):
                 user_list_id = request_data["user_list_id"]
