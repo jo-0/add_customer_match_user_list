@@ -37,11 +37,6 @@ def add_customer_match_user_list(request):
             ]):
                 return make_response("Not enough data", 400)
 
-            if ("user_list_id" in request_data):
-                user_list_id = request_data["user_list_id"]
-            else:
-                user_list_id = ""
-
             bucket_name = request_data["bucket_name"]
             blob_name = request_data["blob_name"]
             customer_id = request_data["customer_id"]
@@ -53,7 +48,8 @@ def add_customer_match_user_list(request):
             try:
                 googleads_service = ga_client.get_service("GoogleAdsService")
 
-                if user_list_id:
+                if ("user_list_id" in request_data):
+                    user_list_id = request_data["user_list_id"]
                     # Override the user_list if it already exists.
                     replace = True
                     # Uses the specified Customer Match user list.
