@@ -3,6 +3,7 @@ import functions_framework
 import hashlib
 import os
 
+from flask import jsonify, make_response
 from google.ads.googleads.client import GoogleAdsClient
 from google.ads.googleads.errors import GoogleAdsException
 from google.cloud import storage
@@ -14,7 +15,9 @@ os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "silken-tenure-383314-4699d25cba0
 
 @functions_framework.http
 def add_customer_match_user_list(request):
-    """HTTP Cloud Function.
+    """HTTP Cloud Function which creates operations to add members to a user list (a.k.a. audience)
+    If a user list already exists, we completely replace the members of a user list with new members.
+
     Args:
         request (flask.Request): The request object.
         <https://flask.palletsprojects.com/en/1.1.x/api/#incoming-request-data>
@@ -45,20 +48,42 @@ def add_customer_match_user_list(request):
 
             ga_client = GoogleAdsClient.load_from_storage()
 
-            raw_records = get_file_from_gcs(
-                blob_name=blob_name,
-                file_path="/tmp/file.csv",
-                bucket_name=bucket_name
-            )
+            raw_records = get_file_from_gcs(blob_name=blob_name, bucket_name=bucket_name)
 
             try:
-                main(
+                googleads_service = ga_client.get_service("GoogleAdsService")
+
+                if user_list_id:
+                    # Override the user_list if it already exists.
+                    replace = True
+                    # Uses the specified Customer Match user list.
+                    user_list_resource_name = googleads_service.user_list_path(
+                        customer_id, user_list_id
+                    )
+                else:
+                    # Creates a Customer Match user list.
+                    user_list_resource_name = create_customer_match_user_list(
+                        ga_client, customer_id
+                    )
+                    replace = False
+
+                job = add_users_to_customer_match_user_list(
                     ga_client=ga_client,
                     customer_id=customer_id,
+                    user_list_resource_name=user_list_resource_name,
                     run_job=True,
-                    user_list_id=user_list_id,
+                    replace=replace,
                     records=raw_records
                 )
+
+                # If run_job is False.
+                if not job:
+                    return make_response("Not running offline user data job", 200)
+
+                response = make_response(jsonify({"status": job.status.name, "job_id": job.id}), 200)
+                response.headers["Content-Type"] = "application/json"
+                return response
+
             except GoogleAdsException as ex:
                 print(
                     f"Request with ID '{ex.request_id}' failed with status "
@@ -69,43 +94,10 @@ def add_customer_match_user_list(request):
                     if error.location:
                         for field_path_element in error.location.field_path_elements:
                             print(f"\t\tOn field: {field_path_element.field_name}")
-                return f"{ex.error.code().name}", 500
+                return make_response(ex.error.code().name, 400)
 
         else:
-            return "Bad request", 400
-
-
-def main(
-    ga_client,
-    customer_id,
-    run_job,
-    user_list_id,
-    records
-):
-    googleads_service = ga_client.get_service("GoogleAdsService")
-
-    if user_list_id:
-        # Override the user_list if it already exists.
-        replace = True
-        # Uses the specified Customer Match user list.
-        user_list_resource_name = googleads_service.user_list_path(
-            customer_id, user_list_id
-        )
-    else:
-        # Creates a Customer Match user list.
-        user_list_resource_name = create_customer_match_user_list(
-            ga_client, customer_id
-        )
-        replace = False
-
-    add_users_to_customer_match_user_list(
-        ga_client=ga_client,
-        customer_id=customer_id,
-        user_list_resource_name=user_list_resource_name,
-        run_job=run_job,
-        replace=replace,
-        records=records
-    )
+            return make_response("Bad request", 400)
 
 
 def create_customer_match_user_list(client, customer_id, list_name="Customer Match list"):
@@ -167,8 +159,14 @@ def add_users_to_customer_match_user_list(
             add users.
         run_job: If true, runs the OfflineUserDataJob after adding operations.
             Otherwise, only adds operations to the job.
+        replace: True when the user list already exists, if true, replaces the existing list with the new list.
+        records: List of raw records. Each element of the list represents a single user and is a dict containing
+            separate entry for the keys "email", "phone", "first_name", "last_name",
+            "country_code", and "postal_code".
         offline_user_data_job_id: ID of an existing OfflineUserDataJob in the
             PENDING state. If None, a new job is created.
+    Returns:
+        The offline user data job or None if run_job is False.
     """
     # Creates the OfflineUserDataJobService client.
     offline_user_data_job_service_client = ga_client.get_service(
@@ -212,6 +210,8 @@ def add_users_to_customer_match_user_list(
     # for more information on the per-request limits.
     operations = []
     if replace:
+        # Note that when a remove_all operation is included, it must be the first operation in a job. If not, then
+        # running the job will return an INVALID_OPERATION_ORDER error.
         operation = ga_client.get_type("OfflineUserDataJobOperation")
         operation.remove_all = True
         operations.append(operation)
@@ -260,7 +260,7 @@ def add_users_to_customer_match_user_list(
             "Not running offline user data job "
             f"'{offline_user_data_job_resource_name}', as requested."
         )
-        return
+        return None
 
     # Issues a request to run the offline user data job for executing all
     # added operations.
@@ -269,107 +269,11 @@ def add_users_to_customer_match_user_list(
     )
 
     # Retrieves and displays the job status.
-    check_job_status(ga_client, customer_id, offline_user_data_job_resource_name)
-
-
-def check_job_status(ga_client, customer_id, offline_user_data_job_resource_name):
-    """Retrieves, checks, and prints the status of the offline user data job.
-    If the job is completed successfully, information about the user list is
-    printed. Otherwise, a GAQL query will be printed, which can be used to
-    check the job status at a later date.
-    Offline user data jobs may take 6 hours or more to complete, so checking the
-    status periodically, instead of waiting, can be more efficient.
-    Args:
-        client: The Google Ads client.
-        customer_id: The ID for the customer that owns the user list.
-        offline_user_data_job_resource_name: The resource name of the offline
-            user data job to get the status of.
-    """
-    query = f"""
-        SELECT
-          offline_user_data_job.resource_name,
-          offline_user_data_job.id,
-          offline_user_data_job.status,
-          offline_user_data_job.type,
-          offline_user_data_job.failure_reason,
-          offline_user_data_job.customer_match_user_list_metadata.user_list
-        FROM offline_user_data_job
-        WHERE offline_user_data_job.resource_name =
-          '{offline_user_data_job_resource_name}'
-        LIMIT 1"""
-
-    # Issues a search request using streaming.
-    google_ads_service = ga_client.get_service("GoogleAdsService")
-    results = google_ads_service.search(customer_id=customer_id, query=query)
-    offline_user_data_job = next(iter(results)).offline_user_data_job
-    status_name = offline_user_data_job.status.name
-    user_list_resource_name = (
-        offline_user_data_job.customer_match_user_list_metadata.user_list
-    )
-
-    print(
-        f"Offline user data job ID '{offline_user_data_job.id}' with type "
-        f"'{offline_user_data_job.type_.name}' has status: {status_name}"
-    )
-
-    if status_name == "SUCCESS":
-        print_customer_match_user_list_info(
-            ga_client, customer_id, user_list_resource_name
-        )
-    elif status_name == "FAILED":
-        print(f"\tFailure Reason: {offline_user_data_job.failure_reason}")
-    elif status_name in ("PENDING", "RUNNING"):
-        print(
-            "To check the status of the job periodically, use the following "
-            f"GAQL query with GoogleAdsService.Search: {query}"
-        )
-
-
-def print_customer_match_user_list_info(
-    ga_client, customer_id, user_list_resource_name
-):
-    """Prints information about the Customer Match user list.
-    Args:
-        client: The Google Ads client.
-        customer_id: The ID for the customer that owns the user list.
-        user_list_resource_name: The resource name of the user list to which to
-            add users.
-    """
-    googleads_service_client = ga_client.get_service("GoogleAdsService")
-
-    # Creates a query that retrieves the user list.
-    query = f"""
-        SELECT
-          user_list.size_for_display,
-          user_list.size_for_search
-        FROM user_list
-        WHERE user_list.resource_name = '{user_list_resource_name}'"""
-
-    # Issues a search request.
-    search_results = googleads_service_client.search(
-        customer_id=customer_id, query=query
-    )
-
-    # Prints out some information about the user list.
-    user_list = next(iter(search_results)).user_list
-    print(
-        "The estimated number of users that the user list "
-        f"'{user_list.resource_name}' has is "
-        f"{user_list.size_for_display} for Display and "
-        f"{user_list.size_for_search} for Search."
-    )
-    print(
-        "Reminder: It may take several hours for the user list to be "
-        "populated. Estimates of size zero are possible."
-    )
+    return check_job_status(ga_client, customer_id, offline_user_data_job_resource_name)
 
 
 def build_offline_user_data_job_operations(ga_client, raw_records):
     """Creates a raw input list of unhashed user information.
-
-    Each element of the list represents a single user and is a dict containing a
-    separate entry for the keys "email", "phone", "first_name", "last_name",
-    "country_code", and "postal_code".
 
     Args:
         ga_client: The Google Ads client.
@@ -490,7 +394,109 @@ def normalize_and_hash(s, remove_all_whitespace):
     return hashlib.sha256(s.encode()).hexdigest()
 
 
-def get_file_from_gcs(blob_name, file_path, bucket_name):
+def check_job_status(ga_client, customer_id, offline_user_data_job_resource_name):
+    """Retrieves, checks, and prints the status of the offline user data job.
+    If the job is completed successfully, information about the user list is
+    printed. Otherwise, a GAQL query will be printed, which can be used to
+    check the job status at a later date.
+    Offline user data jobs may take 6 hours or more to complete, so checking the
+    status periodically, instead of waiting, can be more efficient.
+    Args:
+        client: The Google Ads client.
+        customer_id: The ID for the customer that owns the user list.
+        offline_user_data_job_resource_name: The resource name of the offline
+            user data job to get the status of.
+    Returns:
+        The Offline user data job.
+    """
+    query = f"""
+        SELECT
+          offline_user_data_job.resource_name,
+          offline_user_data_job.id,
+          offline_user_data_job.status,
+          offline_user_data_job.type,
+          offline_user_data_job.failure_reason,
+          offline_user_data_job.customer_match_user_list_metadata.user_list
+        FROM offline_user_data_job
+        WHERE offline_user_data_job.resource_name =
+          '{offline_user_data_job_resource_name}'
+        LIMIT 1"""
+
+    # Issues a search request using streaming.
+    google_ads_service = ga_client.get_service("GoogleAdsService")
+    results = google_ads_service.search(customer_id=customer_id, query=query)
+    offline_user_data_job = next(iter(results)).offline_user_data_job
+    status_name = offline_user_data_job.status.name
+    user_list_resource_name = (
+        offline_user_data_job.customer_match_user_list_metadata.user_list
+    )
+
+    print(
+        f"Offline user data job ID '{offline_user_data_job.id}' with type "
+        f"'{offline_user_data_job.type_.name}' has status: {status_name}"
+    )
+
+    if status_name == "SUCCESS":
+        print_customer_match_user_list_info(
+            ga_client, customer_id, user_list_resource_name
+        )
+    elif status_name == "FAILED":
+        print(f"\tFailure Reason: {offline_user_data_job.failure_reason}")
+    elif status_name in ("PENDING", "RUNNING"):
+        print(
+            "To check the status of the job periodically, use the following "
+            f"GAQL query with GoogleAdsService.Search: {query}"
+        )
+
+    return offline_user_data_job
+
+
+def print_customer_match_user_list_info(ga_client, customer_id, user_list_resource_name):
+    """Prints information about the Customer Match user list.
+    Args:
+        client: The Google Ads client.
+        customer_id: The ID for the customer that owns the user list.
+        user_list_resource_name: The resource name of the user list to which to
+            add users.
+    """
+    googleads_service_client = ga_client.get_service("GoogleAdsService")
+
+    # Creates a query that retrieves the user list.
+    query = f"""
+        SELECT
+          user_list.size_for_display,
+          user_list.size_for_search
+        FROM user_list
+        WHERE user_list.resource_name = '{user_list_resource_name}'"""
+
+    # Issues a search request.
+    search_results = googleads_service_client.search(
+        customer_id=customer_id, query=query
+    )
+
+    # Prints out some information about the user list.
+    user_list = next(iter(search_results)).user_list
+    print(
+        "The estimated number of users that the user list "
+        f"'{user_list.resource_name}' has is "
+        f"{user_list.size_for_display} for Display and "
+        f"{user_list.size_for_search} for Search."
+    )
+    print(
+        "Reminder: It may take several hours for the user list to be "
+        "populated. Estimates of size zero are possible."
+    )
+
+
+def get_file_from_gcs(blob_name, bucket_name):
+    """Get the user list from cloud storage.
+    Args:
+        blob_name: The file of the file.
+        bucket_name: The bucket name in cloud storage
+    Returns:
+        A list of dicts, each dict represents a row from the user list.
+    """
+    file_path = "/tmp/file.csv"
     try:
         storage_client = storage.Client()
         bucket = storage_client.get_bucket(bucket_name)
@@ -503,4 +509,6 @@ def get_file_from_gcs(blob_name, file_path, bucket_name):
         return records
 
     except Exception as e:
-        print("Failed to get file: ", e)
+        message = "Failed to get file from cloud storage"
+        print(f"{message}: {e}")
+        return make_response({"message": message, "error": str(e)}, 404)
